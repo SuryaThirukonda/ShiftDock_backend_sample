@@ -16,21 +16,6 @@ from .models import (
     ShiftStatus,
 )
 
-
-# WebSocket event constants.
-WS_CHECKIN = "employee_checked_in"
-WS_CHECKOUT = "employee_checked_out"
-WS_TASK_COMPLETE = "task_completed"
-WS_TASK_UNCOMPLETE = "task_uncompleted"
-WS_ALERT = "alert_fired"
-WS_SHIFT_UPDATE = "shift_updated"
-
-
-class WSEvent(TypedDict):
-    event_type: str
-    payload: dict
-
-
 # -----------------------------------------------------------------------------
 # Prompt 3 Schemas
 # -----------------------------------------------------------------------------

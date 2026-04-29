@@ -1,17 +1,12 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import get_current_employee, verify_pin
-from ..config import settings
 from ..database import get_db
-from ..security import auth_attempt_guard, make_auth_attempt_key
-from ..services.cache_keys import invalidate_dashboard_and_schedule_cache
-from ..services.notification_service import notification_service
-from ..services.websocket_manager import manager
 
 
 router = APIRouter()
@@ -246,40 +241,11 @@ def _enforce_task_access(
 async def check_in(
     shift_id: int,
     payload: schemas.CheckInRequest,
-    request: Request,
     db: Session = Depends(get_db),
 ):
-    scoped_key = make_auth_attempt_key(
-        scope="shift_pin",
-        request=request,
-        employee_id=payload.employee_id,
-        trust_proxy_headers=settings.TRUST_PROXY_HEADERS,
-    )
-    ip_key = make_auth_attempt_key(
-        scope="shift_pin",
-        request=request,
-        employee_id=None,
-        trust_proxy_headers=settings.TRUST_PROXY_HEADERS,
-    )
-
-    scoped_locked, scoped_retry_after = auth_attempt_guard.is_locked(scoped_key)
-    ip_locked, ip_retry_after = auth_attempt_guard.is_locked(ip_key)
-    if scoped_locked or ip_locked:
-        retry_after = max(scoped_retry_after, ip_retry_after)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed PIN attempts. Please try again later.",
-            headers={"Retry-After": str(retry_after)},
-        )
-
     employee = _get_employee_or_404(db=db, employee_id=payload.employee_id)
     if not verify_pin(payload.pin, employee.pin):
-        auth_attempt_guard.register_failure(scoped_key)
-        auth_attempt_guard.register_failure(ip_key)
         raise HTTPException(status_code=401, detail="Invalid PIN")
-
-    auth_attempt_guard.register_success(scoped_key)
-    auth_attempt_guard.register_success(ip_key)
 
     shift = _get_shift_or_404(db=db, shift_id=shift_id)
     employee_shift = _get_employee_shift_or_404(db=db, shift_id=shift_id, employee_id=employee.id)
@@ -306,26 +272,8 @@ async def check_in(
         shift.actual_start = now
 
     db.commit()
-    invalidate_dashboard_and_schedule_cache()
     db.refresh(employee_shift)
     db.refresh(shift)
-
-    payload = {
-        "shift_id": shift.id,
-        "employee_id": employee.id,
-        "employee_name": employee.name,
-        "role": (employee_shift.role or employee.role).value,
-        "checked_in_at": employee_shift.checked_in_at.isoformat(),
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_CHECKIN,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(
-        event_type=schemas.WS_CHECKIN,
-        payload=payload,
-    )
 
     return _build_employee_shift_out(db=db, employee_shift=employee_shift, shift=shift)
 
@@ -334,41 +282,11 @@ async def check_in(
 async def check_out(
     shift_id: int,
     payload: schemas.CheckOutRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    scoped_key = make_auth_attempt_key(
-        scope="shift_pin",
-        request=request,
-        employee_id=payload.employee_id,
-        trust_proxy_headers=settings.TRUST_PROXY_HEADERS,
-    )
-    ip_key = make_auth_attempt_key(
-        scope="shift_pin",
-        request=request,
-        employee_id=None,
-        trust_proxy_headers=settings.TRUST_PROXY_HEADERS,
-    )
-
-    scoped_locked, scoped_retry_after = auth_attempt_guard.is_locked(scoped_key)
-    ip_locked, ip_retry_after = auth_attempt_guard.is_locked(ip_key)
-    if scoped_locked or ip_locked:
-        retry_after = max(scoped_retry_after, ip_retry_after)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed PIN attempts. Please try again later.",
-            headers={"Retry-After": str(retry_after)},
-        )
-
     employee = _get_employee_or_404(db=db, employee_id=payload.employee_id)
     if not verify_pin(payload.pin, employee.pin):
-        auth_attempt_guard.register_failure(scoped_key)
-        auth_attempt_guard.register_failure(ip_key)
         raise HTTPException(status_code=401, detail="Invalid PIN")
-
-    auth_attempt_guard.register_success(scoped_key)
-    auth_attempt_guard.register_success(ip_key)
 
     shift = _get_shift_or_404(db=db, shift_id=shift_id)
     employee_shift = _get_employee_shift_or_404(db=db, shift_id=shift_id, employee_id=employee.id)
@@ -378,46 +296,13 @@ async def check_out(
     if employee_shift.checked_out_at is not None:
         raise HTTPException(status_code=400, detail="Employee already checked out")
 
-    tasks = _build_tasks_with_completion(db=db, employee_shift=employee_shift, shift=shift)
-    incomplete_tasks = [task.title for task in tasks if not task.completed]
-
-    if incomplete_tasks:
-        background_tasks.add_task(
-            notification_service.notify_incomplete_tasks,
-            db,
-            employee,
-            shift,
-            incomplete_tasks,
-        )
-
     now = datetime.now(timezone.utc)
     employee_shift.checked_out_at = now
     employee_shift.notes = payload.notes
     employee_shift.status = "checked_out"
 
     db.commit()
-    invalidate_dashboard_and_schedule_cache()
     db.refresh(employee_shift)
-
-    tasks_completed = len([task for task in tasks if task.completed])
-    tasks_total = len(tasks)
-
-    payload = {
-        "shift_id": shift.id,
-        "employee_id": employee.id,
-        "employee_name": employee.name,
-        "tasks_completed": tasks_completed,
-        "tasks_total": tasks_total,
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_CHECKOUT,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(
-        event_type=schemas.WS_CHECKOUT,
-        payload=payload,
-    )
 
     return _build_employee_shift_out(db=db, employee_shift=employee_shift, shift=shift)
 
@@ -548,7 +433,6 @@ async def complete_task(
     )
     db.add(completion)
     db.commit()
-    invalidate_dashboard_and_schedule_cache()
     db.refresh(completion)
 
     task_out = schemas.TaskWithCompletion(
@@ -571,30 +455,6 @@ async def complete_task(
         completion_id=completion.id,
         completed_by_employee_id=completed_by_employee_id,
         completed_by_name=completed_by_name,
-    )
-
-    payload = {
-        "shift_id": shift.id,
-        "employee_id": employee_id,
-        "task_id": task.id,
-        "task_title": task.title,
-        "completed_at": completion.completed_at.isoformat(),
-        "is_global": task.scope in {models.TaskScope.role_shared, models.TaskScope.global_shared},
-        "scope": task.scope.value,
-        "completed_by_employee_id": completed_by_employee_id,
-        "completed_by_name": completed_by_name,
-        "completed_by_manager": completion.completed_by_manager,
-        "completion_notes": completion.notes,
-        "completion_id": completion.id,
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_TASK_COMPLETE,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(
-        event_type=schemas.WS_TASK_COMPLETE,
-        payload=payload,
     )
 
     return task_out
@@ -688,24 +548,6 @@ async def uncomplete_task(
 
     db.delete(completion)
     db.commit()
-    invalidate_dashboard_and_schedule_cache()
-
-    payload = {
-        "shift_id": shift.id,
-        "employee_id": employee_id,
-        "task_id": task_id,
-        "is_global": task.scope in {models.TaskScope.role_shared, models.TaskScope.global_shared},
-        "scope": task.scope.value,
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_TASK_UNCOMPLETE,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(
-        event_type=schemas.WS_TASK_UNCOMPLETE,
-        payload=payload,
-    )
 
     return {"ok": True}
 

@@ -11,15 +11,13 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..auth import get_current_employee, require_manager
 from ..database import get_db
-from ..services.cache_keys import invalidate_dashboard_and_schedule_cache
-from ..services.websocket_manager import manager
 
 
 router = APIRouter()
 
 
 def _invalidate_shift_related_cache() -> None:
-    invalidate_dashboard_and_schedule_cache()
+    return None
 
 
 def _time_to_minutes(value: Optional[str]) -> Optional[int]:
@@ -1096,19 +1094,6 @@ async def start_shift(
     _invalidate_shift_related_cache()
     db.refresh(shift)
 
-    payload = {
-        "shift_id": shift.id,
-        "status": shift.status.value,
-        "actual_start": shift.actual_start.isoformat() if shift.actual_start else None,
-        "actual_end": shift.actual_end.isoformat() if shift.actual_end else None,
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_SHIFT_UPDATE,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(event_type=schemas.WS_SHIFT_UPDATE, payload=payload)
-
     return shift
 
 
@@ -1130,18 +1115,5 @@ async def complete_shift(
     db.commit()
     _invalidate_shift_related_cache()
     db.refresh(shift)
-
-    payload = {
-        "shift_id": shift.id,
-        "status": shift.status.value,
-        "actual_start": shift.actual_start.isoformat() if shift.actual_start else None,
-        "actual_end": shift.actual_end.isoformat() if shift.actual_end else None,
-    }
-    await manager.broadcast_to_room(
-        room=f"shift_{shift.id}",
-        event_type=schemas.WS_SHIFT_UPDATE,
-        payload=payload,
-    )
-    await manager.broadcast_to_managers(event_type=schemas.WS_SHIFT_UPDATE, payload=payload)
 
     return shift

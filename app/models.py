@@ -17,7 +17,6 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import deferred, relationship, synonym
 from sqlalchemy.sql import func
 
@@ -1034,14 +1033,14 @@ class AppDocument(Base):
     """Simple document store for application settings.
 
     Each document lives in a ``collection_name`` and has a text ``id``.
-    The payload is stored as JSON/JSONB in the ``data`` column.
+    The payload is stored as JSON in the ``data`` column.
     """
 
     __tablename__ = "app_documents"
 
     collection_name = Column(Text, nullable=False, primary_key=True)
     id = Column(Text, nullable=False, primary_key=True)
-    data = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False)
+    data = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

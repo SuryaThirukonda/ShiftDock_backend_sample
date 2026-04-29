@@ -1,4 +1,4 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
@@ -7,10 +7,8 @@ import hashlib
 import json
 
 from .. import models, schemas
-from ..auth import get_current_employee, hash_pin, require_manager
+from ..auth import create_access_token, get_current_employee, hash_pin, require_manager, verify_pin
 from ..database import get_db
-from ..services.cache_keys import invalidate_dashboard_and_schedule_cache
-from ..services.notification_service import notification_service
 
 
 router = APIRouter()
@@ -146,26 +144,94 @@ class ResetPinRequest(BaseModel):
         return value
 
 
-def _new_employee_email_body(
-    *,
-    employee_name: str,
-    role: models.RoleType,
-    pin: str,
-) -> str:
-    return (
-        f"Hi {employee_name},\n\n"
-        "Your ShiftSync employee account has been created.\n\n"
-        f"Role: {role.value.replace('_', ' ').title()}\n"
-        f"PIN: {pin}\n\n"
-        "You can sign in from the ShiftSync login page by tapping your name and entering this PIN.\n"
-        "If you need help accessing your account, contact your owner/manager.\n\n"
-        "Welcome to ShiftSync."
+class BootstrapOwnerRequest(BaseModel):
+    name: str
+    email: str | None = None
+    phone: str | None = None
+    hourly_wage: float = 11.0
+    pin: str
+
+    @field_validator("pin")
+    @classmethod
+    def validate_pin(cls, value: str) -> str:
+        if not value.isdigit() or not 4 <= len(value) <= 8:
+            raise ValueError("PIN must be 4-8 digits")
+        return value
+
+    @field_validator("hourly_wage")
+    @classmethod
+    def validate_hourly_wage(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("hourly_wage must be >= 0")
+        return round(float(value), 2)
+
+
+def _build_token_response(employee: models.Employee) -> schemas.TokenResponse:
+    access_token = create_access_token({"sub": employee.id})
+    return schemas.TokenResponse(
+        access_token=access_token,
+        employee=schemas.EmployeeOut.model_validate(employee),
     )
+
+
+@router.post("/bootstrap-owner", response_model=schemas.TokenResponse, status_code=status.HTTP_201_CREATED)
+def bootstrap_owner(
+    payload: BootstrapOwnerRequest,
+    db: Session = Depends(get_db),
+):
+    existing_employee = db.query(models.Employee.id).first()
+    if existing_employee is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bootstrap is only available when the database has no employees",
+        )
+
+    if payload.email:
+        duplicate = db.query(models.Employee).filter(models.Employee.email == payload.email).first()
+        if duplicate is not None:
+            raise HTTPException(status_code=400, detail="Employee with that email already exists")
+
+    employee = models.Employee(
+        name=payload.name,
+        email=payload.email,
+        email_notifications_enabled=True,
+        phone=payload.phone,
+        hourly_wage=payload.hourly_wage,
+        pin=hash_pin(payload.pin),
+        role=models.RoleType.owner,
+        is_owner=True,
+        is_active=True,
+    )
+    db.add(employee)
+    db.flush()
+    _sync_employee_roles(employee=employee, db=db, roles=[models.RoleType.owner])
+    db.commit()
+    db.refresh(employee, attribute_names=["role_assignments"])
+    return _build_token_response(employee)
+
+
+@router.post("/login", response_model=schemas.TokenResponse)
+def login_employee(
+    payload: schemas.LoginRequest,
+    db: Session = Depends(get_db),
+):
+    employee = (
+        db.query(models.Employee)
+        .options(selectinload(models.Employee.role_assignments))
+        .filter(
+            models.Employee.id == payload.employee_id,
+            models.Employee.is_active.is_(True),
+        )
+        .first()
+    )
+    if employee is None or not verify_pin(payload.pin, employee.pin):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid employee ID or PIN")
+
+    return _build_token_response(employee)
 
 
 @router.post("/", response_model=schemas.EmployeeOut, status_code=status.HTTP_201_CREATED)
 def create_employee(
-    background_tasks: BackgroundTasks,
     payload: schemas.EmployeeCreate,
     db: Session = Depends(get_db),
     current_employee: models.Employee = Depends(require_manager),
@@ -195,24 +261,7 @@ def create_employee(
     _sync_employee_roles(employee=employee, db=db, roles=normalized_roles)
     db.commit()
     db.refresh(employee, attribute_names=["role_assignments"])
-    invalidate_dashboard_and_schedule_cache()
-
-    creator_is_owner = (
-        current_employee.role == models.RoleType.owner
-        or bool(getattr(current_employee, "is_owner", False))
-    )
-    recipient_email = str(payload.email or "").strip()
-    if creator_is_owner and recipient_email:
-        background_tasks.add_task(
-            notification_service.send_email,
-            recipient_email,
-            "Welcome to ShiftSync",
-            _new_employee_email_body(
-                employee_name=employee.name,
-                role=employee.role,
-                pin=payload.pin,
-            ),
-        )
+    del current_employee
 
     return employee
 
@@ -281,7 +330,6 @@ def update_my_employee_profile(
 
     db.commit()
     db.refresh(employee, attribute_names=["role_assignments"])
-    invalidate_dashboard_and_schedule_cache()
     return employee
 
 
@@ -350,7 +398,6 @@ def update_employee(
 
     db.commit()
     db.refresh(employee, attribute_names=["role_assignments"])
-    invalidate_dashboard_and_schedule_cache()
     return employee
 
 
@@ -367,7 +414,6 @@ def soft_delete_employee(
 
     employee.is_active = False
     db.commit()
-    invalidate_dashboard_and_schedule_cache()
     return {"ok": True}
 
 

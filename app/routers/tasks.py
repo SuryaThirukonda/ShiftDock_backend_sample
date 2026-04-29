@@ -5,21 +5,14 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import require_manager
-from ..config import settings
 from ..database import get_db
-from ..services.cache_keys import (
-    invalidate_dashboard_and_tasks_cache,
-    task_groups_key,
-    tasks_list_key,
-)
-from ..services.cache_service import cache_get_or_set_json
 
 
 router = APIRouter()
 
 
 def _invalidate_task_read_cache() -> None:
-    invalidate_dashboard_and_tasks_cache()
+    return None
 
 
 class ReorderItem(BaseModel):
@@ -290,29 +283,16 @@ def list_tasks(
     include_inactive: bool = False,
     db: Session = Depends(get_db),
 ):
-    cache_key = tasks_list_key(
-        role=role.value if role is not None else None,
-        template_role_id=template_role_id,
-        include_inactive=include_inactive,
-    )
+    query = db.query(models.Task)
+    if role is not None:
+        query = query.filter(models.Task.role == role)
+    if template_role_id is not None:
+        query = query.filter(models.Task.role_id == template_role_id)
+    if not include_inactive:
+        query = query.filter(models.Task.is_active.is_(True))
 
-    def _build_tasks() -> list[schemas.TaskOut]:
-        query = db.query(models.Task)
-        if role is not None:
-            query = query.filter(models.Task.role == role)
-        if template_role_id is not None:
-            query = query.filter(models.Task.role_id == template_role_id)
-        if not include_inactive:
-            query = query.filter(models.Task.is_active.is_(True))
-
-        tasks = query.order_by(models.Task.role.asc(), models.Task.order.asc(), models.Task.id.asc()).all()
-        return [_to_task_out(task) for task in tasks]
-
-    return cache_get_or_set_json(
-        key=cache_key,
-        ttl_seconds=settings.CACHE_TTL_TASKS_SECONDS,
-        builder=_build_tasks,
-    )
+    tasks = query.order_by(models.Task.role.asc(), models.Task.order.asc(), models.Task.id.asc()).all()
+    return [_to_task_out(task) for task in tasks]
 
 
 @router.post("/reorder")
@@ -349,27 +329,18 @@ def list_task_groups(
     current_employee: models.Employee = Depends(require_manager),
 ):
     del current_employee
-    cache_key = task_groups_key(role=role.value if role is not None else None, include_inactive=include_inactive)
+    query = db.query(models.TaskGroup)
+    if role is not None:
+        query = query.filter(models.TaskGroup.role == role)
+    if not include_inactive:
+        query = query.filter(models.TaskGroup.is_active.is_(True))
 
-    def _build_task_groups() -> list[schemas.TaskGroupOut]:
-        query = db.query(models.TaskGroup)
-        if role is not None:
-            query = query.filter(models.TaskGroup.role == role)
-        if not include_inactive:
-            query = query.filter(models.TaskGroup.is_active.is_(True))
-
-        groups = query.order_by(
-            models.TaskGroup.role.asc(),
-            models.TaskGroup.order.asc(),
-            models.TaskGroup.id.asc(),
-        ).all()
-        return [_to_task_group_out(group) for group in groups]
-
-    return cache_get_or_set_json(
-        key=cache_key,
-        ttl_seconds=settings.CACHE_TTL_TASKS_SECONDS,
-        builder=_build_task_groups,
-    )
+    groups = query.order_by(
+        models.TaskGroup.role.asc(),
+        models.TaskGroup.order.asc(),
+        models.TaskGroup.id.asc(),
+    ).all()
+    return [_to_task_group_out(group) for group in groups]
 
 
 @router.post("/groups", response_model=schemas.TaskGroupOut, status_code=status.HTTP_201_CREATED)
